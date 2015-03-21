@@ -1,0 +1,410 @@
+<?php
+
+    /**
+     * Class ConclurerContentStrategy
+     * @property WireDatabasePDO database
+     */
+class ConclurerContentStrategy extends WireData implements Module {
+
+    /**
+     * Returns Information about this Module
+     * @return array
+     */
+    public static function getModuleInfo() {
+        return array(
+            'title' => __('Content Strategy'),
+            'author' => 'Conclurer GbR',
+            'summary' => __('Extends pages for defining individual content strategies'),
+            'version' => 100,
+            'autoload' => true,
+            'singular' => true,
+            'requires' => array('InputfieldCKEditor')
+        );
+    }
+
+    const templateTableName = 'conclurer_content_strategy_templates';
+    const pageTableName = 'conclurer_content_strategy_pages';
+    const selectorCurrentPage = 'self';
+    const selectorNoContentStrategy = 'none';
+
+    /**
+     * Initializes the module's hooks
+     */
+    public function init() {
+        // Hooks for Templates
+        $this->addHookAfter('ProcessTemplate::buildEditForm', $this, 'hookTemplateEditor');
+        $this->addHookBefore('ProcessTemplate::executeSave', $this, 'hookTemplateSave');
+        $this->addHookBefore('Templates::delete', $this, 'hookTemplateDelete');
+
+        // Hooks for Pages
+        $this->addHookAfter('ProcessPageEdit::buildForm', $this, 'hookPageEditor');
+        $this->addHookBefore('ProcessPageEdit::execute', $this, 'hookSavePage');
+        $this->addHookBefore('Pages::delete', $this, 'hookDeletePage');
+    }
+
+    public function ___install() {
+        $table = self::templateTableName;
+        try {
+            $statement = $this->database->prepare("CREATE TABLE `$table` (
+  `template_id` int(11) unsigned NOT NULL DEFAULT '0',
+  `selector` varchar(255) DEFAULT NULL,
+  PRIMARY KEY (`template_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
+            $statement->execute();
+            $this->message(sprintf(__('Database table %s successfully created'), $table));
+        } catch (Exception $e) {
+            throw new WireException(sprintf(__('Database table %s could not be created'), $table));
+        }
+
+        $table2 = self::pageTableName;
+        try {
+            $statement = $this->database->prepare("CREATE TABLE `conclurer_content_strategy_pages` (
+  `page_id` int(11) unsigned NOT NULL,
+  `user_need` text,
+  `condition_need_met` text,
+  `reason_for_page` text,
+  PRIMARY KEY (`page_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
+            $statement->execute();
+            $this->message(sprintf(__('Database table %s successfully created'), $table2));
+        } catch (Exception $e) {
+            throw new WireException(sprintf(__('Database table %s could not be created'), $table));
+        }
+
+        $permission = new Permission();
+        $permission->name = 'page-edit-content-strategy';
+        $permission->title = 'Edit the Content Strategy for individual pages';
+        $permission->save();
+        $this->message(sprintf(__('Permission %s successfully created'), $permission->name));
+    }
+
+    public function ___uninstall() {
+        $table = self::templateTableName;
+        try {
+            $statement = $this->database->prepare("DROP TABLE `$table`");
+            $statement->execute();
+            $this->message(sprintf(__('Database table %s successfully deleted'), $table));
+        } catch (Exception $e) {
+            $this->error(sprintf(__('Database table %s could not be deleted'), $table));
+        }
+
+        $table = self::pageTableName;
+        try {
+            $statement = $this->database->prepare("DROP TABLE `$table`");
+            $statement->execute();
+            $this->message(sprintf(__('Database table %s successfully deleted'), $table));
+        } catch (Exception $e) {
+            $this->error(sprintf(__('Database table %s could not be deleted'), $table));
+        }
+
+        $this->pages->delete($this->permissions->get("name=page-edit-content-strategy"));
+    }
+
+    // Page Editor
+    /**
+     * Extends the Page Editor
+     * @param \HookEvent $event
+     */
+    public function hookPageEditor (HookEvent $event) {
+        $form = $event->return;
+        $page = $event->object->getPage();
+
+        $context = $this->getStrategyContext($page->template);
+        if ($context == 'self') {
+            $readonly = false;
+        }
+        elseif ($context == 'none') {
+            // Cancel if not related regarding to Content Strategy
+            return;
+        }
+        else {
+            $readonly = true;
+        }
+
+        if (!$this->user->hasPermission("page-edit-content-strategy")) {
+            $readonly = true;
+        }
+
+        $tab = new InputfieldWrapper();
+        $tab->attr('class', 'WireTab');
+        $tab->attr('title', __('Content Strategy'));
+        $this->buildPageSettings($tab, $page, $readonly);
+
+        $form->insertAfter($tab, $form->find("id=ProcessPageEditContent")->first());
+    }
+
+    /**
+     * Updates the Content Strategy for the saved page
+     * @param \HookEvent $event
+     */
+    public function hookSavePage (HookEvent $event) {
+        if (!$this->input->post->id) return;
+        if (!$this->user->hasPermission("page-edit-content-strategy")) return;
+
+        $page = $event->object->getPage();
+
+        $allowedInputs = array('content_strategy_user_need', 'content_strategy_condition_need_met', 'content_strategy_reason_for_page');
+        $values = array();
+        foreach ($_POST as $key => $val) {
+            if (in_array($key, $allowedInputs)) {
+                $values[str_replace('content_strategy_', '', $key)] = $this->input->post($key);
+            }
+        }
+
+        // Check if able to store strategy
+        if ($this->getStrategyContext($page->template) != 'self') return;
+
+        // Check if already exists
+        $pageTable = self::pageTableName;
+        $selectStatement = $this->database->prepare("SELECT COUNT(page_id) as num FROM $pageTable WHERE page_id = ?");
+        $selectStatement->execute(array($page->id));
+        $set = $selectStatement->fetch(PDO::FETCH_ASSOC);
+
+        if ($set['num'] > 0) {
+            // Update existing record
+            $columns = array();
+            foreach (array_keys($values) as $key) {
+                $columns[] = "$key = ?";
+            }
+            $columns = implode(', ', $columns);
+            $updateStatement = $this->database->prepare("UPDATE $pageTable SET $columns WHERE page_id = ?");
+            $updateStatement->execute(array_merge(array_values($values), array($page->id)));
+        }
+        else {
+            // Insert new record
+            $columns = array();
+            $placeholders = array();
+            foreach (array_merge(array_keys($values), array('page_id')) as $key) {
+                $columns[] = $key;
+                $placeholders[] = '?';
+            }
+            $columns = implode(', ', $columns);
+            $placeholders = implode(', ', $placeholders);
+
+            $insertStatement = $this->database->prepare("INSERT INTO $pageTable ($columns) VALUES ($placeholders)");
+            $insertStatement->execute(array_merge(array_values($values), array($page->id)));
+        }
+    }
+
+    /**
+     * Removes the entry for the page
+     * @param \HookEvent $event
+     */
+    public function hookDeletePage (HookEvent $event) {
+        $page = $event->arguments[0];
+
+        $tableName = self::pageTableName;
+        $deleteStatement = $this->database->prepare("DELETE FROM $tableName WHERE page_id = ?");
+        $deleteStatement->execute(array($page->id));
+
+    }
+
+    /**
+     * Returns the Properties of the Content Strategy for this page
+     * @param \Page $page
+     *
+     * @return array
+     */
+    public function getStrategyProperties (Page $page) {
+        $context = $this->getStrategyContext($page->template);
+        if ($context == 'self') {
+            $contextPage = $page;
+        }
+        elseif ($context == 'none') {
+            $contextPage = new NullPage();
+        }
+        else {
+            $contextPage = $page->parent($context);
+        }
+
+        // Return empty if not found
+        if ($contextPage instanceof NullPage) {
+            return array(
+                'user_need' => '',
+                'condition_need_met' => '',
+                'reason_for_page' => ''
+            );
+        }
+
+        // Fetch from database
+        $pageTable = self::pageTableName;
+        $selectorStatement = $this->database->prepare("SELECT user_need, condition_need_met, reason_for_page FROM $pageTable WHERE page_id = ?");
+        $selectorStatement->execute(array($contextPage->id));
+        $set = $selectorStatement->fetch(PDO::FETCH_ASSOC);
+
+        // Handle empty result
+        if ($set == null) {
+            return array(
+                'user_need' => '',
+                'condition_need_met' => '',
+                'reason_for_page' => ''
+            );
+        }
+
+        return $set;
+    }
+
+    /**
+     * Builds the Content Strategy Settings for a Page
+     * @param \InputfieldWrapper $wrapper
+     * @param \Page              $page
+     * @param bool               $readonly
+     */
+    protected function ___buildPageSettings(InputfieldWrapper $wrapper, Page $page, $readonly=false) {
+        $variables = $this->getStrategyProperties($page);
+        $fields = array(
+            'content_strategy_user_need' => array(
+                'label' => __('User\'s Need to Address'),
+                'description' => __('This is the user\'s need that this page shall address')
+            ),
+            'content_strategy_condition_need_met' => array(
+                'label' => __('The User\'s Need is met if...'),
+                'description' => __('Based on the need definition: what should the page include to meet the user\'s need?')
+            ),
+            'content_strategy_reason_for_page' => array(
+                'label' => __('The Reason for this Page'),
+                'description' => __('Why is this page on this site?')
+            )
+        );
+
+        foreach ($fields as $name => $options) {
+            $field = $readonly ? $this->modules->get('InputfieldMarkup') : $this->modules->get('InputfieldCKEditor');
+            $field->name = $name;
+
+            //$field->collapsed = Inputfield::collapsedNever;
+
+            $field->label = $options['label'];
+            $field->description = $options['description'];
+            $field->toolbar = "Bold, Italic, -, RemoveFormat\nNumberedList, BulletedList";
+            $field->value = $variables[str_replace('content_strategy_', '', $name)];
+            $wrapper->add($field);
+        }
+    }
+
+    // Template Editor
+    /**
+     * Extends the templates' editor
+     * @param \HookEvent $event
+     */
+    public function hookTemplateEditor (HookEvent $event) {
+        $form = $event->return;
+
+        $tab = new InputfieldWrapper();
+        $tab->attr('class', 'WireTab');
+        $tab->attr('title', __('Content Strategy'));
+
+        // Find template using the id field
+        $template = $this->templates->get($form->get("id")->value);
+        $this->buildTemplateSettings($tab, $template);
+        $form->insertBefore($tab, $form->get("id"));
+
+    }
+
+    /**
+     * Saves the Content Strategy Settings if a template is saved
+     * @param \HookEvent $event
+     */
+    public function hookTemplateSave (HookEvent $event) {
+        $template = $this->templates->get($this->input->post->id);
+
+        $contextAllowed = array('none', 'self', 'custom');
+        $context = in_array($this->input->post->conclurer_content_strategy_context, $contextAllowed) ? $this->input->post->conclurer_content_strategy_context : 'none';
+
+        //Check if template is already connected
+        $templateTable = self::templateTableName;
+        $selectorStatement = $this->database->prepare("SELECT COUNT(`template_id`) as num FROM $templateTable WHERE template_id = ?");
+        $selectorStatement->execute(array($template->id));
+        $set = $selectorStatement->fetch(PDO::FETCH_ASSOC);
+
+        $selectorString = ($context == 'custom') ? $this->input->post->conclurer_content_strategy_selector : $context;
+
+        if ($set['num'] > 0) {
+            // Update existing settings
+            $updateStatement = $this->database->prepare("UPDATE $templateTable SET selector = ? WHERE template_id = ?");
+            $updateStatement->execute(array($selectorString, $template->id));
+        }
+        else {
+            $insertStatement = $this->database->prepare("INSERT INTO $templateTable (template_id, selector) VALUES (?,?)");
+            $insertStatement->execute(array($template->id, $selectorString));
+        }
+    }
+
+    /**
+     * Removes the Content Strategy for one template
+     * @param \HookEvent $event
+     */
+    public function hookTemplateDelete (HookEvent $event) {
+        $template = $event->arguments[0];
+        $ids = array();
+        foreach ($this->pages->find("template=$template") as $page) {
+            $ids[] = $page->id;
+        }
+        $ids = implode(', ', $ids);
+
+        // Remove page entries
+        $pageTable = self::pageTableName;
+        $deletePagesStatement = $this->database->prepare("DELETE FROM $pageTable WHERE page_id IN ($ids)");
+        $deletePagesStatement->execute();
+
+        // Remove template entry
+        $templateTable = self::templateTableName;
+        $deleteTemplateStatement = $this->database->prepare("DELETE FROM $templateTable WHERE template_id = ?");
+        $deleteTemplateStatement->execute(array($template->id));
+    }
+
+    /**
+     * Returns a template's Content Strategy Context
+     * @param \Template $template
+     *
+     * @return string
+     */
+    public function getStrategyContext (Template $template) {
+        $templateTable = self::templateTableName;
+        $selectorStatement = $this->database->prepare("SELECT selector FROM $templateTable WHERE template_id = ?");
+        $selectorStatement->execute(array($template->id));
+        $set = $selectorStatement->fetch(PDO::FETCH_ASSOC);
+        if ($set == null) return 'none';
+
+        return $set['selector'] == '' ? 'none' : $set['selector'];
+    }
+
+    /**
+     * Builds the Content Strategy Settings for a Template
+     * @param \InputfieldWrapper $wrapper
+     * @param \Template          $template
+     */
+    protected function ___buildTemplateSettings (InputfieldWrapper $wrapper, Template $template) {
+        $context = $this->getStrategyContext($template);
+        if ($context == 'none' || $context == 'self') {
+            $selector = '';
+        } else {
+            $selector = $context;
+            $context = 'custom';
+        }
+
+        $contextSelector = $this->modules->get('InputfieldRadios');
+        $contextSelector->name = 'conclurer_content_strategy_context';
+        $contextSelector->label = __('Content Strategy Context');
+        $contextSelector->icon = 'cogs';
+        $contextSelector->collapsed = Inputfield::collapsedNever;
+        $contextSelector->description = __('Sets the context in which the Content Strategy for pages of this template is valid.');
+        $contextSelector->addOption('none', __('Disable Content Strategy for this template'), ($context == 'none' ? array('checked' => 'checked') : array()));
+        $contextSelector->addOption('self', __('This template defines the Content Strategy'), ($context == 'self' ? array('checked' => 'checked') : array()));
+        $contextSelector->addOption('custom', __('Use a custom selector to a page that defines the Content Strategy'), ($context == 'custom' ? array('checked' => 'checked') : array()));
+        $wrapper->add($contextSelector);
+
+        $pageSelector = $this->modules->get('InputfieldText');
+        $pageSelector->name = 'conclurer_content_strategy_selector';
+        $pageSelector->label = __('Content Strategy Definition Selector');
+        $pageSelector->icon = 'cogs';
+        $pageSelector->required = true;
+        $pageSelector->showIf = 'conclurer_content_strategy_context=custom';
+        $pageSelector->requiredIf = 'conclurer_content_strategy_context=custom';
+        $pageSelector->collapsed = Inputfield::collapsedNever;
+        $pageSelector->description = __('Suppy a selector towards another page that defines the content strategy for pages of this template');
+        $pageSelector->notes = __('The selector will be executed relative to the parent pages context of the individual page');
+        $pageSelector->value = $selector;
+        $wrapper->add($pageSelector);
+    }
+
+}
